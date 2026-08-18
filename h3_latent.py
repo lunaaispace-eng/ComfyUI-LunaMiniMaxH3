@@ -22,6 +22,8 @@ prompted the node and ships no licence at all.
 
 from __future__ import annotations
 
+import logging
+
 import comfy.nested_tensor
 import comfy.utils
 import torch
@@ -35,8 +37,14 @@ LATENT_GRID = 5          # ... and the video latent's T is LATENT_GRID*k + LATEN
 LATENT_PHASE = 2
 VIDEO_LATENT_CHANNELS = 24
 AUDIO_LATENT_CHANNELS = 32
+AUDIO_STEREO_AXIS = 2
 
 LOG = "[Luna H3 Concat AV Latent]"
+logger = logging.getLogger("Luna.H3ConcatAVLatent")
+
+# Keys the audio latent may contribute. Everything else stays with the video
+# latent so batch_index / type / control from the soundtrack cannot clobber it.
+_AUDIO_MERGE_KEYS = frozenset({"samples", "noise_mask"})
 
 
 def frame_count_from_latent_t(video_t: int):
@@ -56,13 +64,13 @@ def audio_latent_length(frame_count: int) -> int:
     return round(frame_count / FPS * AUDIO_LATENT_FPS)
 
 
-def _fit_audio(audio, mask, length: int):
+def _fit_audio(audio, mask, length: int, extend_mode: str = "invent"):
     """Cut or extend the audio stream along its time axis to `length` steps.
 
-    Short clips are extended with zeros and the added steps are left *unmasked*,
-    so the model writes something there rather than being told to preserve
-    silence. At denoise < 1 it only partly rewrites them, so a soundtrack much
-    shorter than the footage still trails off — fit it upstream if that matters.
+    Short clips under extend_mode=invent are padded with zeros and the added
+    steps are left *unmasked*. That tail is the official empty-latent prior
+    (EmptyMiniMaxH3LatentAV), not encode(silence): fully rewritten at denoise=1,
+    smeared at denoise < 1. extend_mode=fail refuses to invent a tail.
     """
     have = audio.shape[-1]
     if have == length:
@@ -76,6 +84,13 @@ def _fit_audio(audio, mask, length: int):
     if have > length:
         return audio[..., :length], (None if mask is None else mask[..., :length])
 
+    if extend_mode != "invent":
+        raise RuntimeError(
+            f"{LOG} audio is {have} latent steps, video wants {length}; "
+            f"extend_mode={extend_mode} refuses to invent a tail. Encode a longer "
+            "soundtrack or set extend_mode=invent."
+        )
+
     tail = audio.shape[:-1] + (length - have,)
     audio = torch.cat((audio, audio.new_zeros(tail)), dim=-1)
     if mask is not None:
@@ -84,14 +99,78 @@ def _fit_audio(audio, mask, length: int):
 
 
 def _split(latent, stream: int):
-    """(samples, mask) for one stream, unwrapping an AV latent if that is what it is."""
+    """(samples, mask) for one stream, unwrapping an AV latent if that is what it is.
+
+    Nested samples need at least two streams. Nested samples with a flat mask
+    are refused — reshape_mask would treat a leftover video-shaped mask as audio.
+    A nested mask may be shorter than the sample pair when the missing halves
+    are trailing (CFGGuider.sample appends ones for those). Extra mask streams
+    still raise. Nested mask on a flat stream is refused.
+    """
     samples = latent["samples"]
     mask = latent.get("noise_mask", None)
-    if getattr(samples, "is_nested", False):
-        samples = samples.unbind()[stream]
-        if mask is not None and getattr(mask, "is_nested", False):
-            mask = mask.unbind()[stream]
+    samples_nested = getattr(samples, "is_nested", False)
+    mask_nested = mask is not None and getattr(mask, "is_nested", False)
+
+    if samples_nested:
+        streams = samples.unbind()
+        if len(streams) < 2:
+            raise RuntimeError(
+                f"{LOG} nested latent has {len(streams)} stream(s); "
+                "H3 AV needs 2 (video, audio)."
+            )
+        samples = streams[stream]
+        if mask is None:
+            return samples, mask
+        if not mask_nested:
+            raise RuntimeError(
+                f"{LOG} samples are a nested AV pair but noise_mask is a single "
+                "tensor; split the mask or drop it before concat."
+            )
+        mask_streams = mask.unbind()
+        if len(mask_streams) > len(streams):
+            raise RuntimeError(
+                f"{LOG} nested mask has {len(mask_streams)} stream(s), "
+                f"samples have {len(streams)}."
+            )
+        # Omitted trailing halves: this node emits NestedTensor((video_mask,))
+        # when only the video side is masked, and the sampler pads those with
+        # ones. A missing leading half is not representable and is never emitted.
+        if stream >= len(mask_streams):
+            mask = None
+        else:
+            mask = mask_streams[stream]
+    elif mask_nested:
+        raise RuntimeError(
+            f"{LOG} noise_mask is a nested AV pair but samples are a single stream."
+        )
     return samples, mask
+
+
+def _pair_mismatches(video, audio):
+    """Human-readable contract failures. Empty means the pair is internally consistent."""
+    problems = []
+    if video.shape[1] != VIDEO_LATENT_CHANNELS:
+        problems.append(
+            f"video has {video.shape[1]} channels, H3 expects {VIDEO_LATENT_CHANNELS} (wrong VAE?)"
+        )
+    if audio.shape[1] != AUDIO_LATENT_CHANNELS:
+        problems.append(
+            f"audio has {audio.shape[1]} channels, H3 expects {AUDIO_LATENT_CHANNELS} (wrong VAE?)"
+        )
+    if audio.shape[2] != AUDIO_STEREO_AXIS:
+        problems.append(
+            f"audio stereo axis is {audio.shape[2]}, H3 expects {AUDIO_STEREO_AXIS}"
+        )
+    if video.shape[0] != audio.shape[0]:
+        problems.append(
+            f"batch size {video.shape[0]} (video) vs {audio.shape[0]} (audio)"
+        )
+    if video.device != audio.device:
+        problems.append(f"device {video.device} (video) vs {audio.device} (audio)")
+    if video.dtype != audio.dtype:
+        problems.append(f"dtype {video.dtype} (video) vs {audio.dtype} (audio)")
+    return problems
 
 
 class LunaH3ConcatAVLatent:
@@ -116,16 +195,24 @@ class LunaH3ConcatAVLatent:
                     "tooltip": "Video stream: [B,24,T,H/16,W/16] from VAE Encode with the H3 video VAE. An AV latent works too — its video stream is kept and its audio replaced.",
                 }),
                 "audio_latent": ("LATENT", {
-                    "tooltip": "Audio stream: [B,32,2,T] from VAE Encode Audio with the H3 audio VAE.",
+                    "tooltip": "Audio stream: [B,32,2,T] from VAE Encode Audio with the H3 audio VAE. An AV latent contributes only its audio stream.",
                 }),
                 "fit_audio": ("BOOLEAN", {
                     "default": True, "label_on": "fit to video", "label_off": "as-is",
-                    "tooltip": "ON cuts or extends the audio to the length H3 expects for this video length (frames/24 x 40) — an encoded soundtrack is rarely exactly that, and the mismatch surfaces during sampling rather than here. OFF passes both streams through untouched.",
+                    "tooltip": "ON cuts or extends the audio to the length H3 expects for this video length (frames/24 x 40) — an encoded soundtrack is rarely exactly that, and the mismatch surfaces during sampling rather than here. A short clip is padded with zeros: that tail is the empty-latent prior, not silence. At denoise=1 the model fully rewrites it; at denoise < 1 it smears. OFF passes both streams through untouched.",
+                }),
+                "extend_mode": (["invent", "fail"], {
+                    "default": "invent",
+                    "tooltip": "When fit_audio is on and the soundtrack is shorter than the video-implied length: invent (default) appends zeros — empty-latent prior, not encode(silence); fully rewritten at denoise=1, smeared at denoise < 1. fail raises instead of inventing a tail. Long audio is cut either way.",
+                }),
+                "force": ("BOOLEAN", {
+                    "default": False, "label_on": "force pair", "label_off": "validate",
+                    "tooltip": "OFF raises on channel, stereo-axis, batch, device, or dtype mismatch (wrong VAE or mixed batches). ON logs a warning and pairs anyway.",
                 }),
             },
         }
 
-    def concat(self, video_latent, audio_latent, fit_audio=True):
+    def concat(self, video_latent, audio_latent, fit_audio=True, extend_mode="invent", force=False):
         video, video_mask = _split(video_latent, 0)
         audio, audio_mask = _split(audio_latent, 1)
 
@@ -140,43 +227,50 @@ class LunaH3ConcatAVLatent:
                 f"audio_latent should be 4D [B,{AUDIO_LATENT_CHANNELS},2,T], got {tuple(audio.shape)}. "
                 "Use VAE Encode Audio with H3's audio VAE.")
 
-        # Channel counts are the tell for the wrong VAE: the shapes still look
-        # plausible and the failure lands deep inside the model. Warn rather than
-        # refuse — the pairing itself is not H3-specific.
-        for name, tensor, expected in (("video", video, VIDEO_LATENT_CHANNELS),
-                                       ("audio", audio, AUDIO_LATENT_CHANNELS)):
-            if tensor.shape[1] != expected:
-                print(f"{LOG} {name} latent has {tensor.shape[1]} channels, "
-                      f"H3 expects {expected} - wrong VAE?")
+        problems = _pair_mismatches(video, audio)
+        if problems:
+            msg = f"{LOG} latent pair mismatch: " + "; ".join(problems)
+            if force:
+                logger.warning("%s (force=True, pairing anyway)", msg)
+            else:
+                raise RuntimeError(msg + " — set force to pair anyway.")
 
         if fit_audio:
             frame_count = frame_count_from_latent_t(video.shape[2])
             if frame_count is None:
-                print(f"{LOG} video latent T={video.shape[2]} is not on H3's frame grid; "
-                      "leaving the audio length alone.")
-            else:
-                wanted = audio_latent_length(frame_count)
-                if audio.shape[-1] != wanted:
-                    print(f"{LOG} audio {audio.shape[-1]} -> {wanted} latent steps "
-                          f"({'cut' if audio.shape[-1] > wanted else 'extended'} for {frame_count} frames)")
-                audio, audio_mask = _fit_audio(audio, audio_mask, wanted)
+                raise RuntimeError(
+                    f"{LOG} video latent T={video.shape[2]} is not on H3's 5k+2 grid; "
+                    "cannot derive the audio length. Use an H3 video latent or turn fit_audio off."
+                )
+            wanted = audio_latent_length(frame_count)
+            if audio.shape[-1] != wanted:
+                logger.info(
+                    "%s audio %s -> %s latent steps (%s for %s frames)",
+                    LOG, audio.shape[-1], wanted,
+                    "cut" if audio.shape[-1] > wanted else "extended",
+                    frame_count,
+                )
+            audio, audio_mask = _fit_audio(audio, audio_mask, wanted, extend_mode)
 
-        out = {}
-        out.update(video_latent)
-        out.update(audio_latent)  # keys other than samples: the audio latent's win
+        out = {k: v for k, v in video_latent.items() if k not in _AUDIO_MERGE_KEYS}
+        for key in _AUDIO_MERGE_KEYS:
+            if key in audio_latent:
+                out[key] = audio_latent[key]
         out["samples"] = comfy.nested_tensor.NestedTensor((video, audio))
 
         # A mask on either side has to become a pair as well, or the sampler gets
-        # one stream masked and one not. Each half is conformed to its own stream:
-        # a mask can arrive in any shape (Set Latent Noise Mask hands over image
-        # dimensions), and once the two are wrapped together nothing downstream
-        # resizes them per stream.
+        # one stream masked and one not. CFGGuider.sample pads only *trailing*
+        # nested halves, and stream order is (video, audio), so a missing video
+        # mask cannot be omitted — it would be read as stream 0. A missing audio
+        # mask can: the sampler appends ones for the trailing half.
         if video_mask is not None or audio_mask is not None:
             video_mask = (torch.ones_like(video) if video_mask is None
                           else comfy.utils.reshape_mask(video_mask, video.shape))
-            audio_mask = (torch.ones_like(audio) if audio_mask is None
-                          else comfy.utils.reshape_mask(audio_mask, audio.shape))
-            out["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
+            if audio_mask is None:
+                out["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask,))
+            else:
+                audio_mask = comfy.utils.reshape_mask(audio_mask, audio.shape)
+                out["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
         else:
             out.pop("noise_mask", None)
 

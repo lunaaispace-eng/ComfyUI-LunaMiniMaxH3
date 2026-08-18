@@ -39,6 +39,8 @@ Merges a video latent and an audio latent into the single AV latent H3 samples f
 | `video_latent` | `[B,24,T,H/16,W/16]` from VAE Encode with H3's video VAE |
 | `audio_latent` | `[B,32,2,T]` from VAE Encode Audio with H3's audio VAE |
 | `fit_audio` | cut or extend the audio to the length this video length implies |
+| `extend_mode` | `invent` (default) pads a short clip with zeros; `fail` raises instead |
+| `force` | OFF raises on channel / stereo / batch / device / dtype mismatch |
 
 Output is a `LATENT` whose `samples` is the video+audio pair.
 
@@ -63,19 +65,25 @@ not caught when you wire it up, it surfaces inside the sampler with a shape erro
 
 With `fit_audio` on, the node reads the frame count back off the video latent (H3's
 `17k+5` frames encode to `5k+2` latent steps, so the count is recoverable) and cuts or
-zero-extends the audio to match. Extended steps are left **unmasked**, so the model
-writes something there rather than being told to hold silence — at `denoise < 1` it
-only partly rewrites them, so a soundtrack much shorter than the footage will still
-trail off. Fit it upstream if that matters.
+zero-extends the audio to match. The padded tail is the official **empty-latent prior**,
+not encode(silence): at `denoise = 1` the model fully rewrites it; at `denoise < 1` it
+smears. `extend_mode=fail` refuses to invent that tail. Fit the soundtrack upstream if
+a smear at partial denoise matters.
 
-Turn it off to pass both streams through untouched.
+Turn `fit_audio` off to pass both streams through untouched.
 
-## When it warns
+## When it raises
 
-- **Wrong channel count** (24 video / 32 audio) — the usual sign of the wrong VAE. It
-  warns rather than refusing: the pairing itself is not H3-specific.
-- **Off-grid video latent** — a `T` that is not `5k+2` did not come from H3's frame
-  grid, so there is no frame count to derive; the audio is left as-is.
+- **Wrong channel count** (24 video / 32 audio), stereo axis, batch, device, or dtype —
+  the usual sign of the wrong VAE or a mixed pair. Set `force` to pair anyway.
+- **Off-grid video latent** with `fit_audio` on — a `T` that is not `5k+2` has no
+  recoverable frame count, so the audio length cannot be derived.
+- **Nested AV samples** with a flat `noise_mask`, a nested tensor with fewer than
+  two streams, or a nested mask with *more* streams than the samples — those used
+  to become a silent reshape or an opaque `IndexError`. A nested mask *shorter*
+  than the sample pair is accepted when the missing halves are trailing (video
+  masked, audio omitted): that is this node's own emission, and the same rule
+  the sampler uses.
 
 Shape errors that would otherwise fail deep in the model (a still image where video
 frames belong, audio encoded with the wrong VAE) are raised here with the expected
