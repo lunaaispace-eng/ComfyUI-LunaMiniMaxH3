@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import math
 
+from comfy_api.latest import io
+
 # H3 model parameters.
 CANVAS_MULTIPLE = 32
 BASE_SHORT_EDGE = 768
@@ -88,69 +90,75 @@ def megapixel_canvas(ratio: float, megapixels: float) -> tuple[int, int]:
     return _round_to(math.sqrt(area * ratio)), _round_to(math.sqrt(area / ratio))
 
 
-class LunaMiniMaxH3Canvas:
-    DESCRIPTION = (
-        "Canvas, frame count and frame rates for MiniMax H3, from an aspect ratio "
-        "and a duration in seconds.\n\n"
-        "`H3 canvas` gives the model's own resolution for the ratio — no megapixel "
-        "figure to guess. Switch to `megapixels` to push past it (H3 goes to 2K, at "
-        "roughly four times the attention cost for double the area).\n\n"
-        "Frame count snaps up to H3's sampling grid, and `info` reports the duration "
-        "you actually got. Feed `output_fps` to the save node so interpolation and "
-        "playback rate can never disagree."
-    )
-
-    CATEGORY = "Luna/MiniMax"
-    FUNCTION = "resolve"
-    RETURN_TYPES = ("INT", "INT", "INT", "FLOAT", "FLOAT", "INT", "STRING")
-    RETURN_NAMES = ("width", "height", "length", "fps", "output_fps",
-                    "interpolation_factor", "info")
-
+class LunaMiniMaxH3Canvas(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="LunaMiniMaxH3Canvas",
+            display_name="Luna MiniMax H3 Canvas",
+            category="Luna/MiniMax",
+            description=(
+                "Canvas, frame count and frame rates for MiniMax H3, from an aspect ratio "
+                "and a duration in seconds.\n\n"
+                "`H3 canvas` gives the model's own resolution for the ratio — no megapixel "
+                "figure to guess. Switch to `megapixels` to push past it (H3 goes to 2K, at "
+                "roughly four times the attention cost for double the area).\n\n"
+                "Frame count snaps up to H3's sampling grid, and `info` reports the duration "
+                "you actually got. Feed `output_fps` to the save node so interpolation and "
+                "playback rate can never disagree."
+            ),
+            inputs=[
                 # Named `ratio`, not `aspect_ratio`: the widget row shows name and value
                 # on one line, and the longer name pushed the value into an ellipsis.
-                "ratio": (list(ASPECT_RATIOS), {
-                    "default": "16:9 (widescreen)",
-                    "tooltip": "Shape of the frame, landscape. The canvas follows from it.",
-                }),
-                "portrait": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Turn the ratio on its side. 16:9 becomes 9:16 for Reels and "
-                               "Shorts, 5:4 becomes 4:5 for Instagram, 3:2 becomes 2:3.",
-                }),
-                "size_mode": (SIZE_MODES, {
-                    "default": "H3 canvas",
-                    "tooltip": "H3 canvas: the model's own resolution (1.03 MP at 16:9). "
-                               "megapixels: your own target area, same aspect.",
-                }),
-                "megapixels": ("FLOAT", {
-                    "default": 1.03, "min": 0.1, "max": 8.0, "step": 0.01,
-                    "tooltip": "Only used when size_mode is megapixels.",
-                }),
-                "duration_seconds": ("FLOAT", {
-                    "default": 10.0, "min": 0.2, "max": 150.0, "step": 0.1,
-                    "tooltip": "Snapped up to H3's frame grid; info reports what you got.",
-                }),
-                "interpolation_enabled": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Wire this to the same boolean that gates your frame "
-                               "interpolation nodes. When false the factor is forced to 1 "
-                               "and output_fps drops back to 24, so bypassing the "
-                               "interpolation cannot leave the frame rate doubled.",
-                }),
-                "interpolation_factor": ("INT", {
-                    "default": 2, "min": 1, "max": 8,
-                    "tooltip": "Frames per source frame. Drives both the interpolation "
-                               "node and output_fps, so they cannot drift. Keeps its value "
-                               "while interpolation_enabled is false.",
-                }),
-            }
-        }
+                io.Combo.Input(
+                    "ratio", options=list(ASPECT_RATIOS), default="16:9 (widescreen)",
+                    tooltip="Shape of the frame, landscape. The canvas follows from it.",
+                ),
+                io.Boolean.Input(
+                    "portrait", default=False,
+                    tooltip="Turn the ratio on its side. 16:9 becomes 9:16 for Reels and "
+                            "Shorts, 5:4 becomes 4:5 for Instagram, 3:2 becomes 2:3.",
+                ),
+                io.Combo.Input(
+                    "size_mode", options=SIZE_MODES, default="H3 canvas",
+                    tooltip="H3 canvas: the model's own resolution (1.03 MP at 16:9). "
+                            "megapixels: your own target area, same aspect.",
+                ),
+                io.Float.Input(
+                    "megapixels", default=1.03, min=0.1, max=8.0, step=0.01,
+                    tooltip="Only used when size_mode is megapixels.",
+                ),
+                io.Float.Input(
+                    "duration_seconds", default=10.0, min=0.2, max=150.0, step=0.1,
+                    tooltip="Snapped up to H3's frame grid; info reports what you got.",
+                ),
+                io.Boolean.Input(
+                    "interpolation_enabled", default=True,
+                    tooltip="Wire this to the same boolean that gates your frame "
+                            "interpolation nodes. When false the factor is forced to 1 "
+                            "and output_fps drops back to 24, so bypassing the "
+                            "interpolation cannot leave the frame rate doubled.",
+                ),
+                io.Int.Input(
+                    "interpolation_factor", default=2, min=1, max=8,
+                    tooltip="Frames per source frame. Drives both the interpolation "
+                            "node and output_fps, so they cannot drift. Keeps its value "
+                            "while interpolation_enabled is false.",
+                ),
+            ],
+            outputs=[
+                io.Int.Output(display_name="width"),
+                io.Int.Output(display_name="height"),
+                io.Int.Output(display_name="length"),
+                io.Float.Output(display_name="fps"),
+                io.Float.Output(display_name="output_fps"),
+                io.Int.Output(display_name="interpolation_factor"),
+                io.String.Output(display_name="info"),
+            ],
+        )
 
-    def resolve(self, ratio, portrait, size_mode, megapixels,
+    @classmethod
+    def execute(cls, ratio, portrait, size_mode, megapixels,
                 duration_seconds, interpolation_enabled, interpolation_factor):
         w_ratio, h_ratio = ASPECT_RATIOS[ratio]
         if portrait:
@@ -195,8 +203,4 @@ class LunaMiniMaxH3Canvas:
             info += "  (" + "; ".join(notes) + ")"
 
         print(f"[Luna MiniMax H3 Canvas] {info}")
-        return (width, height, length, FPS, output_fps, factor, info)
-
-
-NODE_CLASS_MAPPINGS = {"LunaMiniMaxH3Canvas": LunaMiniMaxH3Canvas}
-NODE_DISPLAY_NAME_MAPPINGS = {"LunaMiniMaxH3Canvas": "Luna MiniMax H3 Canvas"}
+        return io.NodeOutput(width, height, length, FPS, output_fps, factor, info)

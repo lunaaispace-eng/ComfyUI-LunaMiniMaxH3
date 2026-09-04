@@ -10,20 +10,33 @@ denoise < 1.
 Both are model-specific by design: H3's canvas is determined by its aspect ratio
 and its latents come in pairs, so the generic nodes make you rediscover constants
 the model already fixes.
+
+Registration is the V3 API (`comfy_entrypoint` + `ComfyExtension`). ComfyUI's
+loader takes `NODE_CLASS_MAPPINGS` first and only falls through to
+`comfy_entrypoint` when it is absent (`nodes.py`, "V1 node definition" /
+"V3 Extension Definition") — so a pack is one or the other, never both, and
+defining both would silently keep the pack on V1. Node ids are unchanged, so
+existing workflows still resolve.
 """
 
-from .h3_canvas import (
-    NODE_CLASS_MAPPINGS as _CANVAS_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as _CANVAS_DISPLAY_MAPPINGS,
-)
-from .h3_latent import (
-    NODE_CLASS_MAPPINGS as _LATENT_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as _LATENT_DISPLAY_MAPPINGS,
-)
+from typing_extensions import override
 
-NODE_CLASS_MAPPINGS = {**_CANVAS_CLASS_MAPPINGS, **_LATENT_CLASS_MAPPINGS}
-NODE_DISPLAY_NAME_MAPPINGS = {**_CANVAS_DISPLAY_MAPPINGS, **_LATENT_DISPLAY_MAPPINGS}
+from comfy_api.latest import ComfyExtension, io
+
+from .h3_canvas import LunaMiniMaxH3Canvas
+from .h3_latent import LunaH3ConcatAVLatent
+
+
+class LunaMiniMaxH3Extension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [LunaMiniMaxH3Canvas, LunaH3ConcatAVLatent]
+
+
+async def comfy_entrypoint() -> LunaMiniMaxH3Extension:
+    return LunaMiniMaxH3Extension()
+
 
 WEB_DIRECTORY = "./js"
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+__all__ = ["comfy_entrypoint", "WEB_DIRECTORY"]

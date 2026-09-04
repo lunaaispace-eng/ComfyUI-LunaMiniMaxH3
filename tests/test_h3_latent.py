@@ -81,7 +81,9 @@ def _latent(samples, mask=None, **extra):
 
 
 def _concat(video, audio, **kwargs):
-    return LunaH3ConcatAVLatent().concat(video, audio, **kwargs)[0]
+    # V3: execute is a classmethod and returns io.NodeOutput, whose positional
+    # results live on .result (the old V1 form was a plain tuple).
+    return LunaH3ConcatAVLatent.execute(video, audio, **kwargs).result[0]
 
 
 class GridTests(unittest.TestCase):

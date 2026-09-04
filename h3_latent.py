@@ -27,6 +27,7 @@ import logging
 import comfy.nested_tensor
 import comfy.utils
 import torch
+from comfy_api.latest import io
 
 # MiniMax H3 interface constants, the same set h3_canvas.py works from.
 FPS = 24
@@ -173,46 +174,48 @@ def _pair_mismatches(video, audio):
     return problems
 
 
-class LunaH3ConcatAVLatent:
-    DESCRIPTION = (
-        "Merge a video latent and an audio latent into the joint AV latent MiniMax "
-        "H3 samples from. Built for redrawing existing footage: VAE Encode the "
-        "frames, encode the soundtrack with the audio VAE, wire both in here, then "
-        "sample at denoise < 1. An AV latent in either socket contributes only the "
-        "stream that socket asks for, so wiring one into video_latent keeps its "
-        "video and swaps the audio."
-    )
-    CATEGORY = "Luna/MiniMax"
-    FUNCTION = "concat"
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("latent",)
+class LunaH3ConcatAVLatent(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="LunaH3ConcatAVLatent",
+            display_name="Luna H3ConcatAVLatent",
+            category="Luna/MiniMax",
+            description=(
+                "Merge a video latent and an audio latent into the joint AV latent MiniMax "
+                "H3 samples from. Built for redrawing existing footage: VAE Encode the "
+                "frames, encode the soundtrack with the audio VAE, wire both in here, then "
+                "sample at denoise < 1. An AV latent in either socket contributes only the "
+                "stream that socket asks for, so wiring one into video_latent keeps its "
+                "video and swaps the audio."
+            ),
+            inputs=[
+                io.Latent.Input(
+                    "video_latent",
+                    tooltip="Video stream: [B,24,T,H/16,W/16] from VAE Encode with the H3 video VAE. An AV latent works too — its video stream is kept and its audio replaced.",
+                ),
+                io.Latent.Input(
+                    "audio_latent",
+                    tooltip="Audio stream: [B,32,2,T] from VAE Encode Audio with the H3 audio VAE. An AV latent contributes only its audio stream.",
+                ),
+                io.Boolean.Input(
+                    "fit_audio", default=True, label_on="fit to video", label_off="as-is",
+                    tooltip="ON cuts or extends the audio to the length H3 expects for this video length (frames/24 x 40) — an encoded soundtrack is rarely exactly that, and the mismatch surfaces during sampling rather than here. A short clip is padded with zeros: that tail is the empty-latent prior, not silence. At denoise=1 the model fully rewrites it; at denoise < 1 it smears. OFF passes both streams through untouched.",
+                ),
+                io.Combo.Input(
+                    "extend_mode", options=["invent", "fail"], default="invent",
+                    tooltip="When fit_audio is on and the soundtrack is shorter than the video-implied length: invent (default) appends zeros — empty-latent prior, not encode(silence); fully rewritten at denoise=1, smeared at denoise < 1. fail raises instead of inventing a tail. Long audio is cut either way.",
+                ),
+                io.Boolean.Input(
+                    "force", default=False, label_on="force pair", label_off="validate",
+                    tooltip="OFF raises on channel, stereo-axis, batch, device, or dtype mismatch (wrong VAE or mixed batches). ON logs a warning and pairs anyway.",
+                ),
+            ],
+            outputs=[io.Latent.Output(display_name="latent")],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video_latent": ("LATENT", {
-                    "tooltip": "Video stream: [B,24,T,H/16,W/16] from VAE Encode with the H3 video VAE. An AV latent works too — its video stream is kept and its audio replaced.",
-                }),
-                "audio_latent": ("LATENT", {
-                    "tooltip": "Audio stream: [B,32,2,T] from VAE Encode Audio with the H3 audio VAE. An AV latent contributes only its audio stream.",
-                }),
-                "fit_audio": ("BOOLEAN", {
-                    "default": True, "label_on": "fit to video", "label_off": "as-is",
-                    "tooltip": "ON cuts or extends the audio to the length H3 expects for this video length (frames/24 x 40) — an encoded soundtrack is rarely exactly that, and the mismatch surfaces during sampling rather than here. A short clip is padded with zeros: that tail is the empty-latent prior, not silence. At denoise=1 the model fully rewrites it; at denoise < 1 it smears. OFF passes both streams through untouched.",
-                }),
-                "extend_mode": (["invent", "fail"], {
-                    "default": "invent",
-                    "tooltip": "When fit_audio is on and the soundtrack is shorter than the video-implied length: invent (default) appends zeros — empty-latent prior, not encode(silence); fully rewritten at denoise=1, smeared at denoise < 1. fail raises instead of inventing a tail. Long audio is cut either way.",
-                }),
-                "force": ("BOOLEAN", {
-                    "default": False, "label_on": "force pair", "label_off": "validate",
-                    "tooltip": "OFF raises on channel, stereo-axis, batch, device, or dtype mismatch (wrong VAE or mixed batches). ON logs a warning and pairs anyway.",
-                }),
-            },
-        }
-
-    def concat(self, video_latent, audio_latent, fit_audio=True, extend_mode="invent", force=False):
+    def execute(cls, video_latent, audio_latent, fit_audio=True, extend_mode="invent", force=False):
         video, video_mask = _split(video_latent, 0)
         audio, audio_mask = _split(audio_latent, 1)
 
@@ -274,8 +277,4 @@ class LunaH3ConcatAVLatent:
         else:
             out.pop("noise_mask", None)
 
-        return (out,)
-
-
-NODE_CLASS_MAPPINGS = {"LunaH3ConcatAVLatent": LunaH3ConcatAVLatent}
-NODE_DISPLAY_NAME_MAPPINGS = {"LunaH3ConcatAVLatent": "Luna H3ConcatAVLatent"}
+        return io.NodeOutput(out)
