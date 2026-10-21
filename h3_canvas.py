@@ -105,7 +105,8 @@ class LunaMiniMaxH3Canvas(io.ComfyNode):
                 "roughly four times the attention cost for double the area).\n\n"
                 "Frame count snaps up to H3's sampling grid, and `info` reports the duration "
                 "you actually got. Feed `output_fps` to the save node so interpolation and "
-                "playback rate can never disagree."
+                "playback rate can never disagree. `seconds` is the real duration (length / 24), "
+                "for nodes that think in seconds, such as Luna Asset Loader."
             ),
             inputs=[
                 # Named `ratio`, not `aspect_ratio`: the widget row shows name and value
@@ -154,6 +155,13 @@ class LunaMiniMaxH3Canvas(io.ComfyNode):
                 io.Float.Output(display_name="output_fps"),
                 io.Int.Output(display_name="interpolation_factor"),
                 io.String.Output(display_name="info"),
+                # Added LAST: saved workflows link outputs by slot number, so an
+                # appended output moves nothing.
+                io.Float.Output(display_name="seconds",
+                                tooltip="The real duration, length / 24: what the frame grid "
+                                        "gave, not what was asked (5 s -> 124 frames -> 5.1667 s). "
+                                        "Wire it to Luna Asset Loader's seconds so the song window "
+                                        "matches the shot."),
             ],
         )
 
@@ -203,4 +211,4 @@ class LunaMiniMaxH3Canvas(io.ComfyNode):
             info += "  (" + "; ".join(notes) + ")"
 
         print(f"[Luna MiniMax H3 Canvas] {info}")
-        return io.NodeOutput(width, height, length, FPS, output_fps, factor, info)
+        return io.NodeOutput(width, height, length, FPS, output_fps, factor, info, actual_seconds)

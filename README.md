@@ -105,6 +105,7 @@ hand-written maths expressions.
 | `output_fps` | `24 × interpolation_factor`, for the save node |
 | `interpolation_factor` | the same figure `output_fps` was built from, for the interpolation node |
 | `info` | what you actually got, including any snapping |
+| `seconds` | the real duration, `length / 24` (5 s asked → 124 frames → 5.1667 s), for nodes that take seconds such as Luna Asset Loader |
 
 `interpolation_factor` comes back out on purpose. Drive the frame-interpolation node's
 own factor from it and the frame count, the interpolation and the playback rate all
